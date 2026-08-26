@@ -101,7 +101,11 @@ class BatchUrlImportTool(BaseTool):
         #    honest from the first file instead of sitting at 0%
         ctx.log(f"reading: {url}")
         ctx.progress(0.0, "reading the gallery…")
-        total = gdl.count_items(url)
+        # Reading the gallery meets the same refusals a single download
+        # does, and failing here loses the whole batch rather than one
+        # file — so it is the step most worth another go.
+        total = _with_retry(ctx, lambda: gdl.count_items(url),
+                            what="read that gallery")
         if total == 0:
             raise RuntimeError(
                 "that link has nothing to download. If the gallery is "
@@ -114,8 +118,44 @@ class BatchUrlImportTool(BaseTool):
             ctx.progress(0.02, f"0 / {total}")
 
         # 2. download, reporting through gallery-dl's own output contract
+        #
+        # Sweep more than once. Sites that refuse automated access do it
+        # per item, so a 100-file gallery comes back with 90 and no
+        # complaint — the shortfall is the only evidence anything went
+        # wrong, and nobody notices ten missing files until much later.
+        #
+        # A second pass is nearly free: gallery-dl skips what is already
+        # on disk, so it re-fetches only the gaps.
+        import time
+
         reporter = _Progress(ctx, total)
-        status = gdl.download(url, reporter)
+        passes, status = 3, None
+        listener = _LastError()
+        for attempt in range(1, passes + 1):
+            with listener:
+                status = gdl.download(url, reporter)
+            got = [p for p in dest.rglob("*") if p.is_file()]
+            if total is None or len(got) >= total:
+                break
+            missing = total - len(got)
+            if attempt == passes:
+                ctx.log(f"{missing} file{'s' if missing != 1 else ''} could "
+                        f"not be fetched after {passes} attempts")
+                break
+            # Ask WHY before deciding how long to wait. Without this the
+            # sweep slept 2s then 4s on dropped connections, which is
+            # the mistake that made a 4-second Pinterest download take
+            # 41 in the built-in importer.
+            pause = _pause_for(attempt, listener.text)
+            if listener.text:
+                ctx.log(f"the site's reason: {listener.text[:160]}")
+            ctx.log(f"{missing} of {total} did not arrive — sweeping again "
+                    f"in {pause:.1f}s ({attempt + 1} of {passes}); "
+                    "files already downloaded are kept")
+            ctx.progress(min(0.02 + 0.97 * len(got) / total, 0.99),
+                         f"retrying {missing} missing file"
+                         f"{'s' if missing != 1 else ''}…")
+            time.sleep(pause)
 
         got = sorted(p for p in dest.rglob("*") if p.is_file())
         if not got:
@@ -129,8 +169,112 @@ class BatchUrlImportTool(BaseTool):
                 f"{_pretty_size(size)}")
         if reporter.skipped:
             ctx.log(f"{reporter.skipped} already existed and were reused")
+        # Say it plainly. A silent shortfall is the complaint that
+        # started this: ten missing out of a hundred, and no sign of it
+        # anywhere until the user counts them by hand.
+        if total and len(got) < total:
+            short = total - len(got)
+            ctx.log(f"NOTE: {short} of {total} file"
+                    f"{'s are' if short != 1 else ' is'} still missing — "
+                    "the site refused them. Running the same link again "
+                    "will pick up only what is absent.")
         ctx.progress(1.0)
         return str(dest)
+
+
+def _pause_for(attempt: int, reason) -> float:
+    """How long to wait, asking the host what the failure MEANS.
+
+    A severed connection wants a new socket, not patience; a rate limit
+    wants the opposite. Atelier's netretry table knows the difference.
+
+    Falls back to the one-argument form on purpose: this plugin is
+    installed independently of the app and can land on a host whose
+    netretry predates the error-aware signature. A slower retry is an
+    acceptable degradation there; a TypeError in the middle of somebody
+    else's 240-file gallery is not.
+    """
+    from atelier.core.netretry import backoff
+
+    try:
+        return backoff(attempt, reason)
+    except TypeError:
+        return backoff(attempt)
+
+
+class _LastError:
+    """Catch gallery-dl's reason for a shortfall, so we can act on it.
+
+    gallery-dl does not RAISE when a file fails — it logs and returns a
+    non-zero status, so the sweep below only sees "fewer files than
+    expected" and has no idea why. Measured on Pinterest: 7 connection
+    resets across 5 runs, every one of them a dropped TCP connection to
+    v1.pinimg.com rather than the site refusing us.
+
+    That distinction decides how long to wait before sweeping again, and
+    it is the difference between a 0.4s pause and a 6s one.
+    """
+
+    def __init__(self):
+        import logging
+
+        self.text = ""
+        self._handler = None
+        self._logging = logging
+
+    def __enter__(self):
+        import logging
+
+        listener = self
+
+        class _Catch(logging.Handler):
+            def emit(self, record):
+                try:
+                    listener.text = record.getMessage()
+                except Exception:                     # noqa: BLE001
+                    pass
+
+        self._handler = _Catch(level=logging.WARNING)
+        logging.getLogger("gallery-dl").addHandler(self._handler)
+        logging.getLogger("downloader.ytdl").addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc):
+        if self._handler is not None:
+            for name in ("gallery-dl", "downloader.ytdl"):
+                self._logging.getLogger(name).removeHandler(self._handler)
+        self._handler = None
+        return False
+
+
+def _with_retry(ctx, call, *, what: str, attempts: int = 3):
+    """Run `call`, giving it another go if the failure might not recur.
+
+    The verdict comes from core/netretry so this plugin and the built-in
+    URL Import cannot disagree about which links are hopeless. A private
+    or deleted gallery fails immediately — waiting twice more for the
+    same answer only makes a clear result look like a broken app.
+    """
+    import time
+
+    from atelier.core.netretry import worth_retrying
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:                      # noqa: BLE001
+            if attempt == attempts or not worth_retrying(exc):
+                raise
+            # the ERROR picks the pause: a severed connection wants a
+            # new socket, a rate limit wants patience. Same table the
+            # built-in URL Import uses, for the same reason.
+            pause = _pause_for(attempt, exc)
+            ctx.log(f"could not {what}: {str(exc)[:120]}")
+            ctx.log(f"this often clears on its own — retrying in "
+                    f"{pause:.0f}s ({attempt + 1} of {attempts})")
+            ctx.progress(0.0, f"the site refused that — retrying in "
+                              f"{pause:.0f}s…")
+            time.sleep(pause)
 
 
 def _pretty_size(n: int) -> str:
