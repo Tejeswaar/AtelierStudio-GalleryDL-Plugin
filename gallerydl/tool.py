@@ -42,6 +42,18 @@ class BatchUrlImportTool(BaseTool):
                    "starts, so you know what you asked for. For a single "
                    "video, URL Import is the faster path.")
     input_types = ("url",)
+    # This tool downloads from the web and never opens a model, so it
+    # must not queue behind work that does.
+    #
+    # The app runs one MODEL-LOADING job at a time across the whole
+    # machine (core/gpulock.py) — every tool fights for the same GPU and
+    # parallel jobs just thrash. That turn defaults to "yes, I load a
+    # model", because guessing wrong in the other direction means a new
+    # GPU tool silently escaping the queue and surfacing as a mystery
+    # out-of-memory on somebody else's machine. A network tool has to
+    # say so, and without this line a gallery import waits out a
+    # forty-minute matte for a card it never touches.
+    loads_a_model = False
 
     def params(self) -> list[ParamSpec]:
         return [
