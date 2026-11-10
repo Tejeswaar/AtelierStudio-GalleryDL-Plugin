@@ -29,6 +29,9 @@ from typing import Any
 from atelier.core.hardware import Hardware
 from atelier.tools.base import BaseTool, ParamSpec
 
+_THUMBNAILS = ("none", "jpg", "png", "webp")
+_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv",
+               ".ts")
 _BROWSERS = ("none", "firefox", "chrome", "edge", "brave", "vivaldi",
              "chromium", "safari")
 
@@ -66,6 +69,25 @@ class BatchUrlImportTool(BaseTool):
                       help="Galleries often mix video in with the images. "
                            "Videos are fetched with the same engine URL "
                            "Import uses, so quality matches."),
+            ParamSpec("thumbnails", "Video thumbnails", "choice", "none",
+                      choices=_THUMBNAILS,
+                      choice_labels={"none": "Don't save them",
+                                     "jpg": "Save as JPG", "png": "Save as PNG",
+                                     "webp": "Save as WebP"},
+                      choice_help={
+                          "none": "Just the files the gallery holds.",
+                          "jpg": "Each video's cover picture beside it, under "
+                                 "the same name. Opens everywhere.",
+                          "png": "Lossless — no new blur on top of what the "
+                                 "site sent. Larger.",
+                          "webp": "Often what the site serves, so nothing is "
+                                  "converted. Some older apps cannot open it.",
+                      },
+                      only_when={"include_video": (True,)},
+                      why="Only when videos are included.",
+                      help="The picture a site shows for a video before you "
+                           "press play. Photos in the gallery are already "
+                           "pictures and are not affected."),
             ParamSpec("browser_cookies", "Sign in using browser", "choice",
                       "none", choices=_BROWSERS,
                       help="Private or subscriber-only galleries need a "
@@ -92,6 +114,10 @@ class BatchUrlImportTool(BaseTool):
         limit = int(params.get("limit", 0) or 0)
         browser = params.get("browser_cookies", "none")
 
+        thumbs = str(params.get("thumbnails", "none"))
+        if thumbs not in _THUMBNAILS[1:] or not params.get("include_video",
+                                                            True):
+            thumbs = ""
         dest = Path(work_dir) / gdl.folder_name(url)
         dest.mkdir(parents=True, exist_ok=True)
 
@@ -107,7 +133,8 @@ class BatchUrlImportTool(BaseTool):
         gdl.configure(dest, limit=limit,
                       include_video=bool(params.get("include_video", True)),
                       browser_cookies="" if browser == "none" else browser,
-                      ffmpeg_dir=ffmpeg_dir)
+                      ffmpeg_dir=ffmpeg_dir,
+                      thumbnails=thumbs)
 
         # 1. count first, downloading nothing — this is why the bar is
         #    honest from the first file instead of sitting at 0%
@@ -146,7 +173,7 @@ class BatchUrlImportTool(BaseTool):
         for attempt in range(1, passes + 1):
             with listener:
                 status = gdl.download(url, reporter)
-            got = [p for p in dest.rglob("*") if p.is_file()]
+            got = _items(dest, thumbs)
             if total is None or len(got) >= total:
                 break
             missing = total - len(got)
@@ -169,7 +196,7 @@ class BatchUrlImportTool(BaseTool):
                          f"{'s' if missing != 1 else ''}…")
             time.sleep(pause)
 
-        got = sorted(p for p in dest.rglob("*") if p.is_file())
+        got = sorted(_items(dest, thumbs))
         if not got:
             raise RuntimeError(
                 "nothing was downloaded (gallery-dl status "
@@ -179,6 +206,11 @@ class BatchUrlImportTool(BaseTool):
         size = sum(p.stat().st_size for p in got)
         ctx.log(f"imported {len(got)} file{'s' if len(got) != 1 else ''} · "
                 f"{_pretty_size(size)}")
+        if thumbs:
+            covers = len(_thumbnails(dest, thumbs))
+            ctx.log(f"{covers} video thumbnail{'s' if covers != 1 else ''} "
+                    f"saved as {thumbs.upper()}" if covers else
+                    "no video in this gallery came with a thumbnail")
         if reporter.skipped:
             ctx.log(f"{reporter.skipped} already existed and were reused")
         # Say it plainly. A silent shortfall is the complaint that
@@ -192,6 +224,27 @@ class BatchUrlImportTool(BaseTool):
                     "will pick up only what is absent.")
         ctx.progress(1.0)
         return str(dest)
+
+
+def _thumbnails(dest: Path, fmt: str) -> set[Path]:
+    """The video thumbnails yt-dlp wrote: a `.<fmt>` file named exactly
+    like a video beside it ("clip.mp4" and "clip.jpg"). gallery-dl names
+    a gallery's own pictures by post and number, so one never shares a
+    video's name."""
+    if not fmt:
+        return set()
+    videos = {(p.parent, p.stem) for p in dest.rglob("*")
+              if p.is_file() and p.suffix.lower() in _VIDEO_EXTS}
+    return {p for p in dest.rglob(f"*.{fmt}")
+            if p.is_file() and (p.parent, p.stem) in videos}
+
+
+def _items(dest: Path, fmt: str) -> list[Path]:
+    """The gallery's files, without the thumbnails saved beside videos —
+    those are not items the gallery counted, and counting them would make
+    a sweep that is still missing videos look finished."""
+    covers = _thumbnails(dest, fmt)
+    return [p for p in dest.rglob("*") if p.is_file() and p not in covers]
 
 
 def _pause_for(attempt: int, reason) -> float:

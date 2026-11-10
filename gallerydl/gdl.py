@@ -58,8 +58,33 @@ def folder_name(url: str) -> str:
     return (safe[:80] or "import")
 
 
+#: What a video's thumbnail can be saved as — yt-dlp's
+#: FFmpegThumbnailsConvertor writes these.
+THUMBNAIL_FORMATS = ("jpg", "png", "webp")
+
+
+def ytdl_options(ffmpeg_dir: str = "", thumbnails: str = "") -> dict:
+    """The options handed to yt-dlp for every video in a gallery.
+
+    `thumbnails` is a format from THUMBNAIL_FORMATS, or "" for none. yt-dlp
+    writes the site's thumbnail next to the video under the video's own
+    name ("clip.mp4" and "clip.jpg") and converts it before the video
+    downloads. gallery-dl has no thumbnail setting of its own; its yt-dlp
+    downloader passes these through ("raw-options")."""
+    opts: dict = {}
+    if ffmpeg_dir:
+        opts["ffmpeg_location"] = ffmpeg_dir
+    if thumbnails in THUMBNAIL_FORMATS:
+        opts["writethumbnail"] = True
+        opts["postprocessors"] = [{"key": "FFmpegThumbnailsConvertor",
+                                   "format": thumbnails,
+                                   "when": "before_dl"}]
+    return opts
+
+
 def configure(dest: Path, *, limit: int = 0, include_video: bool = True,
-              browser_cookies: str = "", ffmpeg_dir: str = "") -> None:
+              browser_cookies: str = "", ffmpeg_dir: str = "",
+              thumbnails: str = "") -> None:
     """Point gallery-dl at our folder and our settings, not the user's.
 
     gallery-dl normally reads ~/gallery-dl.conf. We load it (a power
@@ -86,9 +111,15 @@ def configure(dest: Path, *, limit: int = 0, include_video: bool = True,
 
     if include_video:
         config.set(("downloader", "ytdl"), "module", "yt_dlp")
-        if ffmpeg_dir:
-            config.set(("downloader", "ytdl"), "raw-options",
-                       {"ffmpeg_location": ffmpeg_dir})
+        raw = ytdl_options(ffmpeg_dir, thumbnails)
+        if raw:
+            # BOTH homes: a gallery's video goes through the yt-dlp
+            # DOWNLOADER, but a link gallery-dl hands wholly to yt-dlp
+            # (its `ytdl` extractor) builds its own yt-dlp from the
+            # EXTRACTOR's options and never reads the downloader's —
+            # measured: ffmpeg "not installed" with only one set.
+            config.set(("downloader", "ytdl"), "raw-options", raw)
+            config.set(("extractor", "ytdl"), "raw-options", raw)
     else:
         config.set(("extractor",), "videos", False)
 
